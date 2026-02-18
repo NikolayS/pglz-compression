@@ -401,7 +401,7 @@ The header `src/include/common/pg_lzcompress.h` is unchanged — `PGLZ_HistEntry
 
 The compressed output format is unchanged — same tags, same control bytes. But the 4-byte comparison optimization may produce slightly different (equally valid) compressed output for some inputs.
 
-**Required test:** Take a corpus of data (random, compressible, real-world). Compress with stock PG18dev, save the compressed bytes. Compress the same corpus with each patched commit. Verify:
+**Required test:** Take a corpus of data (random, compressible, real-world). Compress with stock PG19dev, save the compressed bytes. Compress the same corpus with each patched commit. Verify:
 1. Both compressed outputs decompress correctly with the stock decompressor.
 2. Both compressed outputs decompress correctly with the patched decompressor.
 3. Both decompress to the identical original data.
@@ -440,8 +440,8 @@ Items explicitly out of scope for this patch set, but worth pursuing:
 ## Implementation progress
 
 ### Infrastructure
-- [ ] PG18dev clone + ASan build (#8)
-- [ ] PG18dev benchmark build (no ASan) (#8)
+- [ ] PG19dev clone + ASan build (#8)
+- [ ] PG19dev benchmark build (no ASan) (#8)
 - [ ] Benchmark harness script (#8)
 
 ### Core implementation
@@ -473,4 +473,4 @@ Items explicitly out of scope for this patch set, but worth pursuing:
 - [pglz bottleneck in insert benchmark](https://smalldatum.blogspot.com/2020/12/tuning-for-insert-benchmark-postgres_4.html)
 - [Unaligned memory access article](https://fastcompression.blogspot.fr/2015/08/accessing-unaligned-memory.html)
 - [LZ4 TOAST compression commit](https://github.com/postgres/postgres/commit/bbe0a81db69bd10bd166907c3701492a29aca294) (PG14)
-- Current source: `src/common/pg_lzcompress.c` (876 lines as of PG18dev)
+- Current source: `src/common/pg_lzcompress.c` (876 lines as of PG19dev)
