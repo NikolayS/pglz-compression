@@ -440,28 +440,33 @@ Items explicitly out of scope for this patch set, but worth pursuing:
 ## Implementation progress
 
 ### Infrastructure
-- [ ] PG19dev clone + ASan build (#8)
-- [ ] PG19dev benchmark build (no ASan) (#8)
-- [ ] Benchmark harness script (#8)
+- [x] PG19dev clone + ASan build (#8)
+- [x] PG19dev benchmark build (no ASan) (#8)
+- [x] Benchmark harness script (#8)
+- [x] Dedicated Hetzner benchmark VM (AMD EPYC-Milan CCX23, nbg1)
 
 ### Core implementation
-- [ ] Step 1: Macros → inline functions (#1)
-- [ ] Step 2: uint16 index-based history (#2)
-- [ ] Step 3: Remove prev pointer + predecessor-scan unlink (#3)
-- [ ] Step 4: 4-byte memcmp in match finding (#4)
-- [ ] Step 5: Fuzz testing + deterministic regression tests (#5)
+- [x] Step 1: Macros → inline functions — PR #10 MERGED
+- [x] Step 2: uint16 index-based history — PR #11 MERGED
+- [x] Step 3: Remove prev pointer + predecessor-scan unlink — PR #12 MERGED
+- [x] Step 4: 4-byte memcmp in match finding — PR #13 MERGED
+- [x] Step 5: Fibonacci multiply-shift hash — PR #14 MERGED (AI alternative, not in Vladimir's original)
 
 ### Validation
-- [ ] Step 6: Full benchmark suite (#6)
-- [ ] Cross-version roundtrip test (#6)
+- [x] Cross-review: all 5 PRs reviewed by ralph, approved (3 minor non-blocking findings fixed)
+- [x] ASan/UBSan roundtrip tests: 132+ boundary sizes, zero findings
+- [x] Fuzz testing: 2.6M iterations, zero findings (PR #9)
+- [x] Cross-version roundtrip: 28 cases, all pass (PR #9)
+- [ ] Step 6: Full end-to-end benchmark suite (#6) — REINDEX + TPC-C + TOAST
 - [ ] perf flamegraph before/after (#6)
 - [ ] Commitfest submission draft (#6)
 
-### AI alternatives (Andrey's challenge)
-- [ ] Better hash function prototype (#7)
-- [ ] Skip-bytes-after-match prototype (#7)
-- [ ] Novel approaches exploration (#7)
-- [ ] Comparison: Vladimir's vs AI alternatives (#7)
+### AI alternatives (Andrey's challenge) — ANSWERED
+- [x] Fibonacci hash prototype + benchmark (#7) — **1.16–1.77× speedup, zero ratio impact** → promoted to Step 5
+- [x] Skip-after-match prototype + benchmark (#7) — **2.2–10× speedup, 1-3pp ratio cost** → documented as follow-on commit
+- [x] 4-byte memcmp analysis (#7) — mixed results; helps pgbench/redundant, may hurt English text
+- [x] Dedicated Hetzner benchmarks (no noisy neighbors) — real numbers posted to issue #7
+- [x] Andrey's question answered: **Fibonacci hash > Vladimir's structural changes alone** for throughput
 
 ## References
 
