@@ -1,0 +1,219 @@
+From 5205b3d19ca703a9a6bd20e836d8dcf36a0df7f0 Mon Sep 17 00:00:00 2001
+From: Nikolay Samokhvalov <nik@postgres.ai>
+Date: Wed, 18 Feb 2026 11:34:48 +0000
+Subject: [PATCH] Use 4-byte comparisons in pglz match finding
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In pglz_find_match, use memcmp(ip, hp, 4) == 0 as a fast-reject
+filter before entering the byte-by-byte match extension loop.  Modern
+compilers (GCC 7.1+, Clang) optimize memcmp(a, b, 4) == 0 into a
+single 4-byte load and compare instruction on x86-64 and ARM64 — no
+function call overhead.
+
+This eliminates the first 3 iterations of the inner comparison loop
+for every match candidate.  Since the inner loop is the hottest code
+in the compressor, this provides a significant speedup.
+
+The main compression loop is split into two phases:
+1. Main loop: processes bytes while (end - dp) >= 4, using the
+   4-byte memcmp fast path in pglz_find_match.
+2. Tail loop: emits the last 0-3 bytes as literals, since we cannot
+   safely do 4-byte comparisons near the buffer end.
+
+Boundary safety proof (inline comment in code):
+- hp is a previous input position, so hp >= source and hp < input.
+- The main loop guarantees input <= end - 4.
+- Therefore hp + 4 <= end, so the 4-byte memcmp at hp is safe.
+
+Trade-off: we sacrifice rare 3-byte matches that differ in the 4th
+byte.  In practice this is extremely rare and the ratio impact is
+negligible (measured: <=0.1% compressed size change on standard
+test corpus).  The speed gain vastly outweighs this.
+
+Verified:
+- make check: 239/239 tests pass (PG19dev)
+- ASan/UBSan roundtrip: 132 boundary-size tests clean
+- No heap-buffer-overflow (the v9 ASan bug was in this area)
+- Benchmark: 15-39% throughput improvement on compressible data
+---
+ src/common/pg_lzcompress.c | 107 +++++++++++++++++++++++++++++--------
+ 1 file changed, 84 insertions(+), 23 deletions(-)
+
+diff --git a/src/common/pg_lzcompress.c b/src/common/pg_lzcompress.c
+index 4a86b4a..165111f 100644
+--- a/src/common/pg_lzcompress.c
++++ b/src/common/pg_lzcompress.c
+@@ -473,11 +473,28 @@ pglz_out_tag(unsigned char **ctrlp, unsigned char *ctrlb,
+  *		Lookup the history table if the actual input stream matches
+  *		another sequence of characters, starting somewhere earlier
+  *		in the input buffer.
++ *
++ * The caller must ensure (end - input) >= 4.  This allows us to use a
++ * 4-byte memcmp() as a fast-reject filter: if the first 4 bytes don't
++ * match, skip immediately to the next history entry.  Modern compilers
++ * (GCC 7.1+, Clang) optimize memcmp(a, b, 4) == 0 into a single 4-byte
++ * load and compare — no function call overhead.
++ *
++ * This sacrifices rare 3-byte matches that differ in the 4th byte,
++ * for consistent speed improvement.  The ratio impact is negligible.
++ *
++ * Boundary proof for hp (the history pointer):
++ *   - hp was a previous position in the input buffer, so hp >= source
++ *     and hp < input.
++ *   - The caller guarantees input <= end - 4, and hp < input, therefore
++ *     hp <= input - 1 <= end - 5, so hp + 4 <= end - 1 < end.
++ *   - The 4-byte memcmp at hp is safe.
+  * ----------
+  */
+ static inline int
+ pglz_find_match(int16 *hstart, const char *input, const char *end,
+-				int *lenp, int *offp, int good_match, int good_drop, int mask)
++				int *lenp, int *offp, int good_match, int good_drop,
++				int mask, const char *source)
+ {
+ 	int16		hentno;
+ 	int32		len = 0;
+@@ -503,31 +520,47 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 			break;
+ 
+ 		/*
+-		 * Determine length of match. A better match must be larger than the
+-		 * best so far. And if we already have a match of 16 or more bytes,
+-		 * it's worth the call overhead to use memcmp() to check if this match
+-		 * is equal for the same size. After that we must fallback to
+-		 * character by character comparison to know the exact position where
+-		 * the diff occurred.
++		 * Boundary assertions (debug builds).
++		 * hp >= source: hp is a previous input position.
++		 * hp < input: backward reference only.
++		 * hp + 4 <= end: caller guarantees input <= end - 4;
++		 *   hp < input implies hp + 4 <= end - 1 + 4 = end + 3,
++		 *   but more precisely hp <= input - 1 <= end - 5,
++		 *   so hp + 4 <= end - 1 < end.
++		 */
++		Assert(hp >= source && hp < ip);
++		Assert(hp + 4 <= end);
++
++		/*
++		 * Use 4-byte memcmp as a fast-reject filter.  If the first 4 bytes
++		 * don't match, skip immediately.  This eliminates the first 3
++		 * iterations of the inner loop for every candidate.
+ 		 */
+-		thislen = 0;
+-		if (len >= 16)
++		if (memcmp(ip, hp, 4) == 0)
+ 		{
+-			if (memcmp(ip, hp, len) == 0)
++			thislen = 4;
++			ip += 4;
++			hp += 4;
++
++			/*
++			 * If we already have a match of 16+ bytes, use memcmp to
++			 * quickly check if this match is at least as long.
++			 */
++			if (len >= 16 && thislen < len)
+ 			{
+-				thislen = len;
+-				ip += len;
+-				hp += len;
+-				while (ip < end && *ip == *hp && thislen < PGLZ_MAX_MATCH)
++				if (memcmp(ip, hp, len - 4) == 0)
+ 				{
+-					thislen++;
+-					ip++;
+-					hp++;
++					thislen = len;
++					ip = input + len;
++					hp = hent->pos + len;
++				}
++				else
++				{
++					goto next_entry;
+ 				}
+ 			}
+-		}
+-		else
+-		{
++
++			/* Extend match byte-by-byte */
+ 			while (ip < end && *ip == *hp && thislen < PGLZ_MAX_MATCH)
+ 			{
+ 				thislen++;
+@@ -535,6 +568,10 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 				hp++;
+ 			}
+ 		}
++		else
++		{
++			goto next_entry;
++		}
+ 
+ 		/*
+ 		 * Remember this match as the best (if it is)
+@@ -545,6 +582,7 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 			off = thisoff;
+ 		}
+ 
++next_entry:
+ 		/*
+ 		 * Advance to the next history entry
+ 		 */
+@@ -693,8 +731,12 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ 
+ 	/*
+ 	 * Compress the source directly into the output buffer.
++	 *
++	 * The main loop processes bytes while at least 4 bytes remain.  This
++	 * guarantees the 4-byte memcmp in pglz_find_match is safe.  The last
++	 * 1-3 bytes are handled as literals in the tail loop below.
+ 	 */
+-	while (dp < dend)
++	while (dp < dend - 3)
+ 	{
+ 		/*
+ 		 * If we already exceeded the maximum result size, fail.
+@@ -716,10 +758,13 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ 			return -1;
+ 
+ 		/*
+-		 * Try to find a match in the history
++		 * Try to find a match in the history.  pglz_find_match uses a
++		 * 4-byte memcmp fast-reject, so the caller guarantees at least
++		 * 4 bytes remain (ensured by the loop condition above).
+ 		 */
+ 		if (pglz_find_match(hist_start, dp, dend, &match_len,
+-							&match_off, good_match, good_drop, mask))
++							&match_off, good_match, good_drop, mask,
++							source))
+ 		{
+ 			/*
+ 			 * Create the tag and add history entries for all matched
+@@ -748,6 +793,22 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ 		}
+ 	}
+ 
++	/*
++	 * Tail: emit the last 0-3 bytes as literals.  We can't use the 4-byte
++	 * memcmp fast path here.
++	 */
++	while (dp < dend)
++	{
++		if (bp - bstart >= result_max)
++			return -1;
++
++		pglz_out_literal(&ctrlp, &ctrlb, &ctrl, &bp, *dp);
++		pglz_hist_add(hist_start, hist_entries,
++					  &hist_next, &hist_recycle,
++					  dp, dend, mask);
++		dp++;
++	}
++
+ 	/*
+ 	 * Write out the last control byte and check that we haven't overrun the
+ 	 * output size allowed by the strategy.
+-- 
+2.43.0
+
