@@ -9,7 +9,7 @@ Speed up the built-in `pglz` compressor in Postgres by 15–30% with zero impact
 pglz is Postgres's only built-in compressor. It is used by:
 
 - **TOAST** — compresses any varlena datum exceeding ~2 KiB. Every Postgres installation uses this, whether or not LZ4/zstd is available. Even when LZ4 is the default for new tables, existing TOAST data compressed with pglz must still be decompressed by the old code, and re-compression after UPDATE still uses pglz unless the column's compression method was explicitly changed.
-- **WAL compression** (`wal_compression = pglz`) — compresses full-page images in WAL records. On write-heavy workloads, pglz can consume 18% of total CPU (measured by Andrey Borodin on a TPC-C cluster with 32 vCPU, 128 GiB RAM, sync replication, 2000 warehouses).
+- **WAL compression** (`wal_compression = pglz`) — compresses full-page images in WAL records. On write-heavy workloads with WAL compression enabled, pglz routinely dominates `perf top` — 12–18% of CPU cycles in production-like TPC-C benchmarks ([pgsql-hackers thread](https://www.postgresql.org/message-id/flat/CAAhFRxj0MTsOp8f162n9YhZVwPwf0OG6z3FqU_8jd%2BULfpbpBg%40mail.gmail.com)).
 - **Base backup compression** (`pg_basebackup --compress=server-pglz`).
 
 LZ4 and zstd have been available since PG14 (TOAST) and PG15 (WAL), but:
