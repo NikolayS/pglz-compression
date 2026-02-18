@@ -452,14 +452,35 @@ Items explicitly out of scope for this patch set, but worth pursuing:
 - [x] Step 4: 4-byte memcmp in match finding — PR #13 MERGED
 - [x] Step 5: Fibonacci multiply-shift hash — PR #14 MERGED (AI alternative, not in Vladimir's original)
 
-### Validation
+### Validation (Sprint 1)
 - [x] Cross-review: all 5 PRs reviewed by ralph, approved (3 minor non-blocking findings fixed)
 - [x] ASan/UBSan roundtrip tests: 132+ boundary sizes, zero findings
 - [x] Fuzz testing: 2.6M iterations, zero findings (PR #9)
 - [x] Cross-version roundtrip: 28 cases, all pass (PR #9)
-- [ ] Step 6: Full end-to-end benchmark suite (#6) — REINDEX + TPC-C + TOAST
-- [ ] perf flamegraph before/after (#6)
-- [ ] Commitfest submission draft (#6)
+
+## Sprint 2 — actual PG patch series + end-to-end benchmarks
+
+### Sprint 1 retrospective
+**What worked:** AI exploration found Fibonacci hash (better than Vladimir's original). Agents autonomous end-to-end. Hetzner caught inflated noisy-server numbers.
+**What failed:** Alpha built standalone benchmark variants instead of patching actual PG source. Noisy-server numbers reached issue #7 before correction. PRs merged before process was confirmed self-directed. Multiple agent restarts lost progress.
+
+### Sprint 2 goals
+The code is proven in standalone harness. Now produce artifacts that can actually be submitted to Postgres commitfest.
+
+### Sprint 2 issues
+- [ ] #15: Apply Steps 1-5 to actual PostgreSQL source (src/common/pg_lzcompress.c)
+- [ ] #16: make check-world clean on each step independently
+- [ ] #17: End-to-end Postgres benchmarks on dedicated Hetzner VM
+- [ ] #18: git format-patch — 5 submission-ready patch emails
+- [ ] #19: Commitfest submission email draft (pgsql-hackers format)
+
+### Sprint 2 rules (learned from Sprint 1)
+- Agents patch ACTUAL PG source, not standalone files
+- Cross-review required before any merge (ralph)
+- No merging until cross-review approves
+- No noisy-server benchmarks — Hetzner VM only for all numbers
+- Agent restarts = lost progress; get prompts right first time
+- SPEC.md is single source of truth; HEARTBEAT.md just points here
 
 ### AI alternatives (Andrey's challenge) — ANSWERED
 - [x] Fibonacci hash prototype + benchmark (#7) — **1.16–1.77× speedup, zero ratio impact** → promoted to Step 5
