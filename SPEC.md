@@ -95,13 +95,19 @@ typedef struct PGLZ_HistEntry {
 
 **Recycling frequency:** After the first 4096 bytes of input, *every* `pglz_hist_add` call recycles an entry (the ring buffer is full). For a typical 8 KiB TOAST datum, half the calls involve recycling. The argument for removing `prev` is not that recycling is rare — it's that the amortized cost of O(chain_length) predecessor scans is lower than the per-insert cost of maintaining `prev` pointers, because chain lengths are short (average <1) and the cache savings from the smaller struct benefit every traversal.
 
-**Chain length defense:** Add `#define PGLZ_MAX_CHAIN 256` as a traversal limit in `pglz_find_match`. If a chain exceeds this length (possible only with pathological hash collisions), break and move on. LZ4 uses a similar technique (exponential backoff). This is defense-in-depth against worst-case O(n) per match attempt.
+**Chain length defense:** Add `#define PGLZ_MAX_CHAIN 256` as a traversal limit **only in `pglz_find_match`**. If a chain exceeds this length (possible only with pathological hash collisions), break and move on. LZ4 uses a similar technique (exponential backoff). This is defense-in-depth against worst-case O(n) per match attempt.
 
-**`hindex` field status:** After removing `prev`, `hindex` is still needed — it tells the recycler which bucket chain to scan for the predecessor. If we decided not to unlink at all (lazy invalidation), `hindex` could be used for a stolen-node check, but since we're unlinking properly, `hindex` serves its original purpose.
+**Critical: `pglz_hist_unlink` must NOT have a chain-length limit.** The unlink must always complete. If we abandon an unlink before finding the predecessor, the entry's `next` field gets overwritten when it's recycled into a new chain — this corrupts the old chain (the predecessor now follows `next` into a completely different bucket's chain). This is the exact chain-corruption scenario that lazy invalidation would have caused.
 
-**Debug assertions:** In Assert-enabled builds, add `Assert(entry->hindex == search_hindex)` during chain traversal to catch any chain corruption immediately.
+**Why no limit is safe:** The pathological case (all 4096 entries in one bucket) requires the input to produce 4096 consecutive identical hash values — which means the data is essentially a single repeated 4-byte pattern. Such data compresses trivially (every match is maximal), so the O(n) unlink cost per insert is amortized against O(1) match finding on degenerate inputs. The comment in `pglz_hist_unlink` should say: *"The unlink must complete to prevent chain corruption. The worst case (all entries in one bucket) requires degenerate input that compresses trivially, so the amortized cost is acceptable."*
 
-**Risk:** Moderate. The predecessor scan is a new code path that must be tested thoroughly. Must verify no regression on pathological hash collision inputs.
+**`hindex` field status:** After removing `prev`, `hindex` is still needed — it tells the recycler which bucket chain to scan for the predecessor.
+
+**Debug assertions:** In Assert-enabled builds:
+- `Assert(entry->hindex == search_hindex)` during chain traversal to catch corruption.
+- `Assert(false)` in the "entry not found" path of `pglz_hist_unlink` — if the entry isn't in the chain, our bookkeeping is wrong. In non-assert builds, return silently as defense against corruption, but this path should never execute.
+
+**Risk:** Moderate. The predecessor scan is a new code path that must be tested thoroughly. Must verify no regression on pathological hash collision inputs. Must benchmark the unlink cost in isolation (see step 6).
 
 ### 4. Use 4-byte comparisons instead of byte-by-byte
 
@@ -153,9 +159,9 @@ if (memcmp(ip, hp, 4) == 0) {
 
 1. Change `PGLZ_HistEntry` to use `int16 next` (index, -1 = end), `uint16 hindex`, `const char *pos`. Put `pos` first for natural alignment.
 2. Change `hist_start` from `int16 *` (pointer to entry) to `int16` (index, -1 = empty).
-3. Use `-1` as the sentinel (no entry). Indexes 0..4095 map directly to `hist_entries[0..4095]`. Initialize `hist_start` with `memset(hist_start, 0xFF, ...)` for -1, or loop-assign.
+3. Use `-1` as the sentinel (no entry). Indexes 0..4095 map directly to `hist_entries[0..4095]`. Initialize `hist_start` with a loop (`for (i = 0; i < PGLZ_HISTORY_LISTS; i++) hist_start[i] = -1`). A `memset(hist_start, 0xFF, ...)` also works (sets each byte to 0xFF → int16 value -1 in two's complement), but a loop is unambiguous and the cost is negligible (runs once per `pglz_compress` call, 8192 iterations). In Postgres core, unambiguous wins over clever.
 4. Add compile-time assertions: `StaticAssertExpr(PGLZ_MAX_HISTORY_LISTS <= UINT16_MAX)`, `StaticAssertExpr(PGLZ_HISTORY_SIZE <= INT16_MAX)`.
-5. Keep `prev` as `int16` for now — removal is step 3. The intermediate state has a doubly-linked list with indexes instead of pointers.
+5. Keep `prev` as `int16` for now — removal is step 3. The intermediate state has a doubly-linked list with indexes instead of pointers. **Note:** This means Step 2 implements index-based doubly-linked unlink logic (~15 lines) that is deleted in Step 3. The index-based doubly-linked unlink is more subtle than the pointer version: `hist_entries[entry->prev].next = entry->next` plus special-casing when `prev == -1` (entry is chain head, update `hist_start[entry->hindex]`). This intermediate complexity is the cost of commit independence — a reviewer can verify Step 2 is correct in isolation. If pgsql-hackers pushes back on the throwaway code, Steps 2 and 3 can be merged into one commit ("Replace pointer-based history with index-based singly-linked hash table"). But the default approach is to keep them separate per Tomas/Andres's request for logical splits.
 6. Update `pglz_hist_add` and `pglz_find_match` to use index arithmetic.
 7. In the commit message, state the invariant: "bucket chains remain valid; each entry belongs to exactly one bucket; -1 terminates every chain."
 
@@ -186,9 +192,13 @@ pglz_hist_unlink(int16 *hist_start, PGLZ_HistEntry *hist_entries,
         }
         pp = &hist_entries[*pp].next;
     }
-    /* Entry not found in chain — already unlinked or chain was truncated.
-     * This can happen if a chain-length limit caused early break during
-     * a previous traversal that would have found this entry. Safe to ignore. */
+    /*
+     * Entry not found in chain — bookkeeping is wrong.
+     * The unlink must always succeed because we never cap this traversal.
+     * In assert builds, treat this as a bug. In production, return silently
+     * as defense against corruption — the entry will be overwritten anyway.
+     */
+    Assert(false);  /* should not happen */
 }
 ```
 
@@ -209,12 +219,15 @@ pglz_hist_unlink(int16 *hist_start, PGLZ_HistEntry *hist_entries,
 ```c
 /* In the main compression loop: */
 while (dp < dend) {
-    /* If fewer than 4 bytes remain, emit literals — no match possible
-     * that would save space (min match = 3, but tag = 2-3 bytes). */
+    /* If fewer than 4 bytes remain, we cannot use the 4-byte memcmp
+     * fast path. Fall back to the original byte-by-byte matching for
+     * the tail, or emit literals. A 3-byte match can still save space
+     * (replaces 3 literal bytes with a 2-byte tag), so we keep the
+     * old comparison path for the last 1-3 bytes. */
     if (dend - dp < 4) {
-        pglz_out_literal(ctrlp, ctrlb, ctrl, bp, *dp);
-        pglz_hist_add(..., dp, dend, mask);
-        dp++;
+        /* Use original byte-by-byte match logic for tail bytes */
+        pglz_find_match_bytewise(...);  /* or inline byte compare */
+        /* If no match found, emit literal */
         continue;
     }
 
@@ -239,7 +252,7 @@ if (memcmp(ip, hp, 4) == 0) {
 }
 ```
 
-3. **Boundary proof for `hp`:** Since `hp` always points earlier in the input buffer than `ip` (we're matching backward), and `ip <= end - 4` is guaranteed by the caller, `hp + 4 <= ip + 4 <= end`. For overlapping matches (offset < 4), `hp + 4` may exceed `ip`, but the memory is valid (it's within the input buffer). Add `Assert(hp + 4 <= end)` in debug builds and a block comment proving this invariant.
+3. **Boundary proof for `hp`:** Since `hp` is a previous position in the input buffer, we know `hp >= source` and `hp < ip`. Since the caller guarantees `ip <= end - 4`, we have `hp <= ip - 1 <= end - 5`, therefore `hp + 4 <= end - 1 < end`. The assert holds strictly. History entries from previous `pglz_compress` calls cannot leak — `hist_start` is reinitialized at the start of every call. Add assertions in debug builds: `Assert(hp >= source && hp < ip)` and `Assert(hp + 4 <= end)`. Put the proof as a block comment directly next to the code, not just in the commit message — reviewers need to see it inline.
 
 4. **Critically:** verify that `pglz_hist_add` does not read past the buffer end. The hash function (`pglz_hist_idx`) reads 4 bytes starting from the current position. The existing code has a `(end - s) < 4` fallback to `(int)s[0]`, but this boundary must be verified under ASan with inputs of every length mod 4.
 
@@ -257,27 +270,42 @@ if (memcmp(ip, hp, 4) == 0) {
 Create a standalone fuzz target `fuzz_pglz.c` that links against the modified `pg_lzcompress.c`:
 
 ```c
-/* fuzz_pglz.c — libFuzzer target for pglz */
+/* fuzz_pglz.c — libFuzzer target for pglz round-trip */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    char compressed[PGLZ_MAX_OUTPUT(size)];
-    char decompressed[size + 1];
+    if (size > 1024 * 1024)  /* cap at 1 MiB — pglz inputs are bounded */
+        return 0;
+
+    char *compressed = malloc(PGLZ_MAX_OUTPUT(size));
+    char *decompressed = malloc(size);
+    if (!compressed || !decompressed) {
+        free(compressed);
+        free(decompressed);
+        return 0;
+    }
 
     int32 clen = pglz_compress((const char *)data, size,
                                compressed, PGLZ_strategy_always);
     if (clen >= 0) {
         int32 dlen = pglz_decompress(compressed, clen,
                                      decompressed, size, true);
-        assert(dlen == size);
+        assert(dlen == (int32)size);
         assert(memcmp(data, decompressed, size) == 0);
     }
+
+    free(compressed);
+    free(decompressed);
     return 0;
 }
 ```
+
+Note: the original version used VLAs (`char compressed[PGLZ_MAX_OUTPUT(size)]`) — these blow the stack on large fuzzer inputs. `malloc` with a 1 MiB cap is the safe pattern.
 
 - Compile with ASan + UBSan: `-fsanitize=address,undefined,fuzzer`
 - Run for at least 10M iterations
 - Focus corpus: lengths 0–8192, especially N where N % 4 ∈ {1,2,3}, history-wrap boundaries (4096, 4097), TOAST threshold (2048)
 - **Every commit must pass fuzz testing independently**, not just the final result
+- **Test both strategies:** `PGLZ_strategy_always` (for coverage — always enters the hot loop) and `PGLZ_strategy_default` (for realistic TOAST behavior — early-bailout path matters)
+- **Pragmatic approach for merging:** Put the fuzz harness in the submission branch and run it in CI, but don't insist on committing it to core (libFuzzer in-tree is controversial). Instead, add a deterministic roundtrip regression test (`src/test/modules/test_pglz/`) with carefully chosen sizes: 0, 1, 2, 3, 4, 5, 2048, 4096, 4097 bytes — this is much more likely to be accepted.
 
 ### Step 6: Benchmark and commit message preparation
 
@@ -286,10 +314,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
    - Andrey's test: `REINDEX table pgbench_accounts` (scale 100) with `wal_compression = on`.
    - TPC-C workload with `wal_compression = on` if feasible.
    - TOAST-heavy workload: insert 1M rows of compressible text into a text column.
-   - **Worst-case test:** random (incompressible) data — must show no regression from stolen-node checks or memcmp overhead on miss.
+   - **Worst-case test:** random (incompressible) data — must show no regression from predecessor-scan checks or memcmp overhead on miss.
+   - **Both strategies:** Test with `PGLZ_strategy_default` (realistic TOAST, where early-bailout matters) and `PGLZ_strategy_always` (WAL compression, where the hot loop always runs). Speedup numbers may differ significantly — the optimizations primarily help the hot loop.
 2. Measure on both x86-64 and ARM64 if possible.
 3. Benchmark each commit independently (not just the combined result) so reviewers can see the isolated contribution of each optimization.
-4. Prepare the commitfest submission with a clear summary email to pgsql-hackers.
+4. **Isolate Step 3 cost:** Specifically measure `pglz_compress` throughput on a 1 MiB input before and after Step 3 (doubly-linked O(1) unlink vs singly-linked predecessor-scan). If the predecessor-scan shows a measurable regression, that's a signal to either improve the hash function first or reconsider the approach. The cache benefit of removing `prev` should outweigh the scan cost, but this must be measured, not assumed.
+5. Prepare the commitfest submission with a clear summary email to pgsql-hackers.
 
 ## Key design decisions
 
@@ -329,7 +359,7 @@ Andrey Borodin raised the question: are Vladimir's 2020 optimizations the best w
 
 These produce the same compressed format and can coexist with the four core optimizations:
 
-1. **Better hash function.** The current hash `(s[0]<<6 ^ s[1]<<4 ^ s[2]<<2 ^ s[3]) & mask` dates from the 1990s. A multiply-shift hash (e.g., `((read32(s) * 2654435761u) >> (32 - log2(hashsz)))`) would produce fewer collisions, shortening chain traversals. This could be a fifth independent commit. Worth prototyping.
+1. **Better hash function (strongly recommended fifth commit).** The current hash `(s[0]<<6 ^ s[1]<<4 ^ s[2]<<2 ^ s[3]) & mask` dates from the 1990s and is a weak polynomial rolling hash with only 14 bits of entropy spread across 4 bytes. Collision rates are high for structured data (SQL result sets, JSON, repeated ASCII patterns where upper bits of each byte are similar). A Fibonacci hash like `((read32(s) * 2654435761u) >> shift)` would dramatically reduce collision rates, which directly shortens chain traversals. This matters more than it seems: if the average chain length drops from 2 to 0.5, the predecessor-scan unlink in Step 3 becomes essentially free, and `PGLZ_MAX_CHAIN` becomes truly defense-only. It also makes the 4-byte memcmp optimization more effective because fewer chain entries are false positives. **This is independent, low-risk (pure function replacement, same interface), and likely compounds the gains from Steps 2–4.** It has a nice narrative for pgsql-hackers: "We fixed the data structure (Steps 2–3), the inner loop (Step 4), and the hash function (Step 5)."
 
 2. **Skip bytes after long matches.** After emitting a match of N bytes, the current code adds all N bytes to the history table. For long matches (say, >16 bytes), most of those history entries are redundant — the next useful match is likely at or near the end of the current match. LZ4 and zstd skip intermediate bytes. This trades a marginal compression ratio loss for significant speed on compressible data. Could be significant since `pglz_hist_add` is hot in the profile.
 
@@ -347,7 +377,7 @@ These would require format changes or new infrastructure — interesting but sep
 
 ### Decision
 
-Start with the four proven optimizations (reviewed, benchmarked, understood). Prototype the hash function improvement (#1) and history-skip (#2) as optional fifth and sixth commits. If they show measurable improvement, include them. If not, ship without them.
+Start with the four proven optimizations (reviewed, benchmarked, understood). **The hash function improvement (#1) is strongly recommended as a fifth commit** — it's independent, low-risk, and likely compounds the gains from Steps 2–4 by reducing chain lengths. Prototype the history-skip (#2) as an optional sixth commit. If they show measurable improvement, include them. If not, ship without them.
 
 The key insight: the four core optimizations attack the data structure (cache misses, memory layout) and the inner loop (branch elimination). These are the right targets — `perf` profiles show the time is split between hash table operations and match comparison, not the hash function itself. But we should measure, not assume.
 
@@ -404,7 +434,7 @@ Items explicitly out of scope for this patch set, but worth pursuing:
 6. Benchmark shows ≥15% speedup on compressible data (TOAST-heavy workload).
 7. Benchmark shows ≥10% speedup on WAL compression workload.
 8. No measurable regression on random (incompressible) data.
-9. Compression ratio change is ≤1 byte on standard test corpus.
+9. No statistically meaningful compression ratio regression: ≤0.1% compressed size delta on standard test corpus (report worst-case and median). The previous "≤1 byte" criterion was too strict — different match choices can shift boundaries by more than 1 byte on large inputs while being negligible overall.
 10. Each commit is independently reviewable, committable, and fuzz-clean.
 
 ## References
