@@ -437,6 +437,32 @@ Items explicitly out of scope for this patch set, but worth pursuing:
 9. No statistically meaningful compression ratio regression: ≤0.1% compressed size delta on standard test corpus (report worst-case and median). The previous "≤1 byte" criterion was too strict — different match choices can shift boundaries by more than 1 byte on large inputs while being negligible overall.
 10. Each commit is independently reviewable, committable, and fuzz-clean.
 
+## Implementation progress
+
+### Infrastructure
+- [ ] PG18dev clone + ASan build (#8)
+- [ ] PG18dev benchmark build (no ASan) (#8)
+- [ ] Benchmark harness script (#8)
+
+### Core implementation
+- [ ] Step 1: Macros → inline functions (#1)
+- [ ] Step 2: uint16 index-based history (#2)
+- [ ] Step 3: Remove prev pointer + predecessor-scan unlink (#3)
+- [ ] Step 4: 4-byte memcmp in match finding (#4)
+- [ ] Step 5: Fuzz testing + deterministic regression tests (#5)
+
+### Validation
+- [ ] Step 6: Full benchmark suite (#6)
+- [ ] Cross-version roundtrip test (#6)
+- [ ] perf flamegraph before/after (#6)
+- [ ] Commitfest submission draft (#6)
+
+### AI alternatives (Andrey's challenge)
+- [ ] Better hash function prototype (#7)
+- [ ] Skip-bytes-after-match prototype (#7)
+- [ ] Novel approaches exploration (#7)
+- [ ] Comparison: Vladimir's vs AI alternatives (#7)
+
 ## References
 
 - [pgsql-hackers thread: "pglz compression performance, take two"](https://www.postgresql.org/message-id/flat/CAAhFRxj0MTsOp8f162n9YhZVwPwf0OG6z3FqU_8jd%2BULfpbpBg%40mail.gmail.com)
