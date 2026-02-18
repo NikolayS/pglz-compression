@@ -1,1 +1,6 @@
 bench/bench_pglz
+bench_pglz_asan
+bench_pglz_baseline
+test_asan_*
+!test_asan_roundtrip.c
+bench_step*
