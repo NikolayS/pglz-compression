@@ -4,3 +4,4 @@ bench_pglz_baseline
 test_asan_*
 !test_asan_roundtrip.c
 bench_step*
+dump_*
