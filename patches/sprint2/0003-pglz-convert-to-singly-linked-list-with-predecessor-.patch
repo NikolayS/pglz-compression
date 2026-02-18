@@ -1,0 +1,213 @@
+From 46c30e4af5e04679b9b354b618d538fde02c86bc Mon Sep 17 00:00:00 2001
+From: Nikolay Samokhvalov <nik@postgres.ai>
+Date: Wed, 18 Feb 2026 18:43:08 +0000
+Subject: [PATCH 3/5] pglz: convert to singly-linked list with predecessor-scan
+ unlink
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The doubly-linked list (with prev index) required updating two entries on
+insert and three on unlink, but the unlink case (recycling old entries) is
+the only place prev was needed.  Replace with singly-linked list and a
+predecessor-scan unlink via pglz_hist_unlink().
+
+PGLZ_HistEntry layout changes:
+- Remove int16 prev field (saves 2 bytes per entry)
+- Struct is now: pos(8B) + next(2B) + hindex(2B) + pad(4B) = 16 bytes
+  (same size as step 2 — padding fills the gap)
+
+pglz_hist_unlink() scans forward from the chain head to find the
+predecessor and splices out the entry in O(chain_length) time.
+
+CRITICAL: pglz_hist_unlink() has NO chain-length limit.  If we abandon
+an unlink scan prematurely, the entry's next field gets overwritten when
+it is recycled into a new chain — the predecessor in the old chain then
+follows next into a completely different bucket's chain, corrupting it
+silently.  The worst case requires 4096 consecutive identical hash values
+(degenerate data that trivially compresses), so the amortized cost is
+acceptable.
+
+pglz_find_match() adds a PGLZ_MAX_CHAIN=256 chain traversal limit as
+defense-in-depth against pathological hash collisions.  This limit is
+safe there because we are only reading, not unlinking — a missed entry
+just means a suboptimal match, not corruption.
+
+make check: 239/239 tests pass
+---
+ src/common/pg_lzcompress.c | 107 ++++++++++++++++++++++++++-----------
+ 1 file changed, 75 insertions(+), 32 deletions(-)
+
+diff --git a/src/common/pg_lzcompress.c b/src/common/pg_lzcompress.c
+index 3176068..b340ab8 100644
+--- a/src/common/pg_lzcompress.c
++++ b/src/common/pg_lzcompress.c
+@@ -197,15 +197,25 @@
+ #define PGLZ_MAX_MATCH			273
+ 
+ 
++/*
++ * Maximum chain traversal length in pglz_find_match.  Defense-in-depth
++ * against pathological hash collisions — bounds worst-case match-finding
++ * to O(PGLZ_MAX_CHAIN) per input byte.  LZ4 uses a similar technique.
++ */
++#define PGLZ_MAX_CHAIN			256
++
+ /* ----------
+  * PGLZ_HistEntry -
+  *
+- *		Linked list for the backward history lookup
++ *		Singly-linked list for the backward history lookup
++ *
++ * Each entry lives in exactly one hash bucket chain at a time.  When an
++ * entry is recycled (ring buffer wraps), it is unlinked from its old
++ * chain via predecessor scan before being inserted into the new chain.
+  *
+- * All the entries sharing a hash key are linked in a doubly linked list
+- * using indexes into the hist_entries[] array.  Using int16 indexes
+- * instead of pointers shrinks each entry from 32 bytes to 16 bytes on
+- * 64-bit platforms, halving the working set and improving cache behavior.
++ * Using int16 indexes instead of pointers, and removing the prev pointer,
++ * keeps each entry at 16 bytes on 64-bit platforms (pos 8B + next 2B +
++ * hindex 2B + 4B padding).
+  *
+  * The sentinel value -1 means "no entry" (end of chain or empty bucket).
+  * Indexes 0..PGLZ_HISTORY_SIZE map directly to hist_entries[0..N].
+@@ -215,9 +225,8 @@ typedef struct PGLZ_HistEntry
+ {
+ 	const char *pos;			/* my input position — 8 bytes */
+ 	int16		next;			/* index of next entry in chain, -1 = end */
+-	int16		prev;			/* index of prev entry in chain, -1 = head */
+ 	uint16		hindex;			/* hash bucket this entry belongs to */
+-	/* 2 bytes tail padding to align struct to 8 */
++	/* 4 bytes tail padding to align struct to 8 */
+ } PGLZ_HistEntry;
+ 
+ /* Compile-time size checks */
+@@ -305,13 +314,58 @@ pglz_hist_idx(const char *s, const char *end, int mask)
+ }
+ 
+ 
++/* ----------
++ * pglz_hist_unlink -
++ *
++ *		Unlink an entry from its current bucket chain by scanning forward
++ *		from the chain head to find the predecessor, then splice out.
++ *
++ * CRITICAL: This function must NOT have a chain-length limit.  If we
++ * abandon an unlink before finding the predecessor, the entry's next
++ * field gets overwritten when recycled into a new chain — this corrupts
++ * the old chain (the predecessor now follows next into a completely
++ * different bucket's chain).
++ *
++ * The worst case (all 4096 entries in one bucket) requires the input
++ * to produce 4096 consecutive identical hash values — degenerate data
++ * that compresses trivially, so the amortized cost is acceptable.
++ * ----------
++ */
++static inline void
++pglz_hist_unlink(int16 *hstart, PGLZ_HistEntry *hentries, int16 entry_idx)
++{
++	PGLZ_HistEntry *entry = &hentries[entry_idx];
++	int16	   *pp = &hstart[entry->hindex];
++
++	while (*pp != PGLZ_INVALID_ENTRY)
++	{
++		if (*pp == entry_idx)
++		{
++			*pp = entry->next;	/* splice out */
++			return;
++		}
++		pp = &hentries[*pp].next;
++	}
++
++	/*
++	 * Entry not found in chain — bookkeeping is wrong.  In assert builds,
++	 * treat this as a bug.  In production, return silently as defense
++	 * against corruption — the entry will be overwritten anyway.
++	 */
++#ifdef USE_ASSERT_CHECKING
++	Assert(false);				/* should not happen */
++#endif
++}
++
++
+ /* ----------
+  * pglz_hist_add -
+  *
+  *		Adds a new entry to the history table.
+  *
+  * If *recycle is true, then we are recycling a previously used entry,
+- * and must first delink it from its old hashcode's linked list.
++ * and must first unlink it from its old bucket chain via predecessor
++ * scan (singly-linked unlink).
+  *
+  * hist_next and recycle are modified by this function.
+  *
+@@ -330,36 +384,14 @@ pglz_hist_add(int16 *hstart, PGLZ_HistEntry *hentries,
+ 
+ 	if (*recycle)
+ 	{
+-		/*
+-		 * Unlink this entry from its old bucket chain (doubly-linked
+-		 * index-based unlink).
+-		 */
+-		if (myhe->prev == PGLZ_INVALID_ENTRY)
+-		{
+-			/* Entry is chain head — update hist_start */
+-			hstart[myhe->hindex] = myhe->next;
+-		}
+-		else
+-		{
+-			hentries[myhe->prev].next = myhe->next;
+-		}
+-
+-		if (myhe->next != PGLZ_INVALID_ENTRY)
+-		{
+-			hentries[myhe->next].prev = myhe->prev;
+-		}
++		/* Unlink from old bucket chain (predecessor scan) */
++		pglz_hist_unlink(hstart, hentries, entry_idx);
+ 	}
+ 
+ 	/* Insert at head of the new bucket chain */
+ 	myhe->next = hstart[hindex];
+-	myhe->prev = PGLZ_INVALID_ENTRY;
+ 	myhe->hindex = (uint16) hindex;
+ 	myhe->pos = s;
+-
+-	/* Link old chain head back to us */
+-	if (hstart[hindex] != PGLZ_INVALID_ENTRY)
+-		hentries[hstart[hindex]].prev = entry_idx;
+-
+ 	hstart[hindex] = entry_idx;
+ 
+ 	if (++(*hist_next) >= PGLZ_HISTORY_SIZE + 1)
+@@ -453,6 +485,7 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 	int16		hentno;
+ 	int32		len = 0;
+ 	int32		off = 0;
++	int			chain_len = 0;
+ 
+ 	/*
+ 	 * Traverse the linked history list until a good enough match is found.
+@@ -521,6 +554,16 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 		 */
+ 		hentno = hent->next;
+ 
++		/*
++		 * Defense-in-depth: limit chain traversal to PGLZ_MAX_CHAIN hops.
++		 * This bounds worst-case per-byte cost with pathological hash
++		 * collisions.  Normal inputs have average chain length < 1
++		 * (4096 entries / 8192 buckets), so this limit is never hit in
++		 * practice.
++		 */
++		if (++chain_len >= PGLZ_MAX_CHAIN)
++			break;
++
+ 		/*
+ 		 * Be happy with lesser good matches the more entries we visited. But
+ 		 * no point in doing calculation if we're at end of list.
+-- 
+2.43.0
+
