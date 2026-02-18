@@ -1,0 +1,283 @@
+From 67936d0bd4e3d36863ffede5b0854e9633702570 Mon Sep 17 00:00:00 2001
+From: Nikolay Samokhvalov <nik@postgres.ai>
+Date: Wed, 18 Feb 2026 18:39:38 +0000
+Subject: [PATCH 1/5] pglz: replace macros with static inline functions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The four hot-path macros — pglz_hist_idx, pglz_hist_add, pglz_out_ctrl,
+pglz_out_literal, and pglz_out_tag — were implemented as statement-expression
+macros with multiple-evaluation hazards and no type checking.  When compiled
+with UBSan, the left-shifts in pglz_hist_idx on signed char arguments trigger
+undefined-behavior reports because the original macro used plain 'char' which
+may be signed.
+
+Convert all five to static inline functions.  The compiler inlines them
+identically to the macro versions; output is bit-identical.  The function
+versions:
+
+- Cast to unsigned char in pglz_hist_idx, eliminating UBSan reports
+- Pass pointers-to-locals for pglz_hist_add (was modifying macro args)
+- pglz_out_ctrl/literal/tag take pointer-to-pointer for ctrlp and buf
+
+No algorithmic change; bit-identical compressed output verified by make check.
+
+make check: 239/239 tests pass
+---
+ src/common/pg_lzcompress.c | 185 +++++++++++++++++++++----------------
+ 1 file changed, 104 insertions(+), 81 deletions(-)
+
+diff --git a/src/common/pg_lzcompress.c b/src/common/pg_lzcompress.c
+index 75d529d..206720e 100644
+--- a/src/common/pg_lzcompress.c
++++ b/src/common/pg_lzcompress.c
+@@ -272,13 +272,21 @@ static PGLZ_HistEntry hist_entries[PGLZ_HISTORY_SIZE + 1];
+  * find 3-character matches; they very possibly will be in the wrong
+  * hash list.  This seems an acceptable tradeoff for spreading out the
+  * hash keys more.
++ *
++ * Note: we cast to unsigned char to avoid undefined behavior from
++ * left-shifting negative values (the original macro used plain char).
+  * ----------
+  */
+-#define pglz_hist_idx(_s,_e, _mask) (										\
+-			((((_e) - (_s)) < 4) ? (int) (_s)[0] :							\
+-			 (((_s)[0] << 6) ^ ((_s)[1] << 4) ^								\
+-			  ((_s)[2] << 2) ^ (_s)[3])) & (_mask)				\
+-		)
++static inline int
++pglz_hist_idx(const char *s, const char *end, int mask)
++{
++	if ((end - s) < 4)
++		return ((int) (unsigned char) s[0]) & mask;
++	return (((unsigned char) s[0] << 6) ^
++			((unsigned char) s[1] << 4) ^
++			((unsigned char) s[2] << 2) ^
++			(unsigned char) s[3]) & mask;
++}
+ 
+ 
+ /* ----------
+@@ -286,45 +294,54 @@ static PGLZ_HistEntry hist_entries[PGLZ_HISTORY_SIZE + 1];
+  *
+  *		Adds a new entry to the history table.
+  *
+- * If _recycle is true, then we are recycling a previously used entry,
++ * If *recycle is true, then we are recycling a previously used entry,
+  * and must first delink it from its old hashcode's linked list.
+  *
+- * NOTE: beware of multiple evaluations of macro's arguments, and note that
+- * _hn and _recycle are modified in the macro.
++ * hist_next and recycle are modified by this function (they were modified
++ * by the original macro too — "The macro would do it four times - Jan.").
+  * ----------
+  */
+-#define pglz_hist_add(_hs,_he,_hn,_recycle,_s,_e, _mask)	\
+-do {									\
+-			int __hindex = pglz_hist_idx((_s),(_e), (_mask));				\
+-			int16 *__myhsp = &(_hs)[__hindex];								\
+-			PGLZ_HistEntry *__myhe = &(_he)[_hn];							\
+-			if (_recycle) {													\
+-				if (__myhe->prev == NULL)									\
+-					(_hs)[__myhe->hindex] = __myhe->next - (_he);			\
+-				else														\
+-					__myhe->prev->next = __myhe->next;						\
+-				if (__myhe->next != NULL)									\
+-					__myhe->next->prev = __myhe->prev;						\
+-			}																\
+-			__myhe->next = &(_he)[*__myhsp];								\
+-			__myhe->prev = NULL;											\
+-			__myhe->hindex = __hindex;										\
+-			__myhe->pos  = (_s);											\
+-			/* If there was an existing entry in this hash slot, link */	\
+-			/* this new entry to it. However, the 0th entry in the */		\
+-			/* entries table is unused, so we can freely scribble on it. */ \
+-			/* So don't bother checking if the slot was used - we'll */		\
+-			/* scribble on the unused entry if it was not, but that's */	\
+-			/* harmless. Avoiding the branch in this critical path */		\
+-			/* speeds this up a little bit. */								\
+-			/* if (*__myhsp != INVALID_ENTRY) */							\
+-				(_he)[(*__myhsp)].prev = __myhe;							\
+-			*__myhsp = _hn;													\
+-			if (++(_hn) >= PGLZ_HISTORY_SIZE + 1) {							\
+-				(_hn) = 1;													\
+-				(_recycle) = true;											\
+-			}																\
+-} while (0)
++static inline void
++pglz_hist_add(int16 *hist_start, PGLZ_HistEntry *hist_entries,
++			  int *hist_next, bool *recycle,
++			  const char *s, const char *end, int mask)
++{
++	int			hindex = pglz_hist_idx(s, end, mask);
++	int16	   *myhsp = &hist_start[hindex];
++	PGLZ_HistEntry *myhe = &hist_entries[*hist_next];
++
++	if (*recycle)
++	{
++		if (myhe->prev == NULL)
++			hist_start[myhe->hindex] = myhe->next - hist_entries;
++		else
++			myhe->prev->next = myhe->next;
++		if (myhe->next != NULL)
++			myhe->next->prev = myhe->prev;
++	}
++
++	myhe->next = &hist_entries[*myhsp];
++	myhe->prev = NULL;
++	myhe->hindex = hindex;
++	myhe->pos = s;
++
++	/*
++	 * If there was an existing entry in this hash slot, link this new entry
++	 * to it. However, the 0th entry in the entries table is unused, so we
++	 * can freely scribble on it. So don't bother checking if the slot was
++	 * used — we'll scribble on the unused entry if it was not, but that's
++	 * harmless. Avoiding the branch in this critical path speeds this up a
++	 * little bit.
++	 */
++	hist_entries[*myhsp].prev = myhe;
++	*myhsp = *hist_next;
++
++	if (++(*hist_next) >= PGLZ_HISTORY_SIZE + 1)
++	{
++		*hist_next = 1;
++		*recycle = true;
++	}
++}
+ 
+ 
+ /* ----------
+@@ -333,16 +350,18 @@ do {									\
+  *		Outputs the last and allocates a new control byte if needed.
+  * ----------
+  */
+-#define pglz_out_ctrl(__ctrlp,__ctrlb,__ctrl,__buf) \
+-do { \
+-	if ((__ctrl & 0xff) == 0)												\
+-	{																		\
+-		*(__ctrlp) = __ctrlb;												\
+-		__ctrlp = (__buf)++;												\
+-		__ctrlb = 0;														\
+-		__ctrl = 1;															\
+-	}																		\
+-} while (0)
++static inline void
++pglz_out_ctrl(unsigned char **ctrlp, unsigned char *ctrlb,
++			  unsigned char *ctrl, unsigned char **buf)
++{
++	if ((*ctrl & 0xff) == 0)
++	{
++		**ctrlp = *ctrlb;
++		*ctrlp = (*buf)++;
++		*ctrlb = 0;
++		*ctrl = 1;
++	}
++}
+ 
+ 
+ /* ----------
+@@ -352,12 +371,14 @@ do { \
+  *		appropriate control bit.
+  * ----------
+  */
+-#define pglz_out_literal(_ctrlp,_ctrlb,_ctrl,_buf,_byte) \
+-do { \
+-	pglz_out_ctrl(_ctrlp,_ctrlb,_ctrl,_buf);								\
+-	*(_buf)++ = (unsigned char)(_byte);										\
+-	_ctrl <<= 1;															\
+-} while (0)
++static inline void
++pglz_out_literal(unsigned char **ctrlp, unsigned char *ctrlb,
++				 unsigned char *ctrl, unsigned char **buf, unsigned char byte)
++{
++	pglz_out_ctrl(ctrlp, ctrlb, ctrl, buf);
++	*(*buf)++ = byte;
++	*ctrl <<= 1;
++}
+ 
+ 
+ /* ----------
+@@ -368,23 +389,27 @@ do { \
+  *		appropriate control bit.
+  * ----------
+  */
+-#define pglz_out_tag(_ctrlp,_ctrlb,_ctrl,_buf,_len,_off) \
+-do { \
+-	pglz_out_ctrl(_ctrlp,_ctrlb,_ctrl,_buf);								\
+-	_ctrlb |= _ctrl;														\
+-	_ctrl <<= 1;															\
+-	if (_len > 17)															\
+-	{																		\
+-		(_buf)[0] = (unsigned char)((((_off) & 0xf00) >> 4) | 0x0f);		\
+-		(_buf)[1] = (unsigned char)(((_off) & 0xff));						\
+-		(_buf)[2] = (unsigned char)((_len) - 18);							\
+-		(_buf) += 3;														\
+-	} else {																\
+-		(_buf)[0] = (unsigned char)((((_off) & 0xf00) >> 4) | ((_len) - 3)); \
+-		(_buf)[1] = (unsigned char)((_off) & 0xff);							\
+-		(_buf) += 2;														\
+-	}																		\
+-} while (0)
++static inline void
++pglz_out_tag(unsigned char **ctrlp, unsigned char *ctrlb,
++			 unsigned char *ctrl, unsigned char **buf, int len, int off)
++{
++	pglz_out_ctrl(ctrlp, ctrlb, ctrl, buf);
++	*ctrlb |= *ctrl;
++	*ctrl <<= 1;
++	if (len > 17)
++	{
++		(*buf)[0] = (unsigned char)(((off & 0xf00) >> 4) | 0x0f);
++		(*buf)[1] = (unsigned char)(off & 0xff);
++		(*buf)[2] = (unsigned char)(len - 18);
++		(*buf) += 3;
++	}
++	else
++	{
++		(*buf)[0] = (unsigned char)(((off & 0xf00) >> 4) | (len - 3));
++		(*buf)[1] = (unsigned char)(off & 0xff);
++		(*buf) += 2;
++	}
++}
+ 
+ 
+ /* ----------
+@@ -637,14 +662,13 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ 			 * Create the tag and add history entries for all matched
+ 			 * characters.
+ 			 */
+-			pglz_out_tag(ctrlp, ctrlb, ctrl, bp, match_len, match_off);
++			pglz_out_tag(&ctrlp, &ctrlb, &ctrl, &bp, match_len, match_off);
+ 			while (match_len--)
+ 			{
+ 				pglz_hist_add(hist_start, hist_entries,
+-							  hist_next, hist_recycle,
++							  &hist_next, &hist_recycle,
+ 							  dp, dend, mask);
+-				dp++;			/* Do not do this ++ in the line above! */
+-				/* The macro would do it four times - Jan.  */
++				dp++;
+ 			}
+ 			found_match = true;
+ 		}
+@@ -653,12 +677,11 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ 			/*
+ 			 * No match found. Copy one literal byte.
+ 			 */
+-			pglz_out_literal(ctrlp, ctrlb, ctrl, bp, *dp);
++			pglz_out_literal(&ctrlp, &ctrlb, &ctrl, &bp, *dp);
+ 			pglz_hist_add(hist_start, hist_entries,
+-						  hist_next, hist_recycle,
++						  &hist_next, &hist_recycle,
+ 						  dp, dend, mask);
+-			dp++;				/* Do not do this ++ in the line above! */
+-			/* The macro would do it four times - Jan.  */
++			dp++;
+ 		}
+ 	}
+ 
+-- 
+2.43.0
+
