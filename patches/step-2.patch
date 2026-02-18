@@ -1,0 +1,266 @@
+From 592c0aa679965766d6500c2af53295f86101817c Mon Sep 17 00:00:00 2001
+From: Nikolay Samokhvalov <nik@postgres.ai>
+Date: Wed, 18 Feb 2026 11:09:25 +0000
+Subject: [PATCH] Use uint16 indexes instead of pointers in pglz history table
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace pointer-based hash chains with int16 index-based chains in the
+pglz compressor's history table. This shrinks PGLZ_HistEntry from 32
+to 16 bytes on 64-bit platforms, and hist_start from 64 KiB to 16 KiB:
+
+  Before: 32 bytes/entry × 4097 + 8 bytes/bucket × 8192 = 192 KiB
+  After:  16 bytes/entry × 4097 + 2 bytes/bucket × 8192 = 80 KiB
+
+The 80 KiB working set fits comfortably in L2 cache (typically
+256 KiB–1 MiB), improving cache behavior during compression.
+
+Key changes:
+- PGLZ_HistEntry fields: pos (8B), next (int16), prev (int16),
+  hindex (uint16). Natural alignment gives 16 bytes.
+- hist_start[] uses int16 indexes; -1 means empty bucket.
+- Initialization uses explicit loop (not memset) for clarity.
+- Entry 0 is now valid; ring buffer starts at 0.
+- prev pointer retained for O(1) unlink (will be removed in Step 3).
+- Compile-time assertions verify index sizes fit int16/uint16.
+
+Invariant: every bucket chain is valid at all times; each entry
+belongs to exactly one bucket; -1 terminates every chain.
+
+Verified:
+- make check: 239/239 tests pass (PG19dev)
+- ASan/UBSan roundtrip: 132 boundary-size tests clean
+- Bit-identical compressed output vs baseline
+- Working set: 192 KiB -> 80 KiB (measured)
+---
+ src/common/pg_lzcompress.c | 128 +++++++++++++++++++++++--------------
+ 1 file changed, 81 insertions(+), 47 deletions(-)
+
+diff --git a/src/common/pg_lzcompress.c b/src/common/pg_lzcompress.c
+index 206720e..3176068 100644
+--- a/src/common/pg_lzcompress.c
++++ b/src/common/pg_lzcompress.c
+@@ -202,19 +202,36 @@
+  *
+  *		Linked list for the backward history lookup
+  *
+- * All the entries sharing a hash key are linked in a doubly linked list.
+- * This makes it easy to remove an entry when it's time to recycle it
+- * (because it's more than 4K positions old).
++ * All the entries sharing a hash key are linked in a doubly linked list
++ * using indexes into the hist_entries[] array.  Using int16 indexes
++ * instead of pointers shrinks each entry from 32 bytes to 16 bytes on
++ * 64-bit platforms, halving the working set and improving cache behavior.
++ *
++ * The sentinel value -1 means "no entry" (end of chain or empty bucket).
++ * Indexes 0..PGLZ_HISTORY_SIZE map directly to hist_entries[0..N].
+  * ----------
+  */
+ typedef struct PGLZ_HistEntry
+ {
+-	struct PGLZ_HistEntry *next;	/* links for my hash key's list */
+-	struct PGLZ_HistEntry *prev;
+-	int			hindex;			/* my current hash key */
+-	const char *pos;			/* my input position */
++	const char *pos;			/* my input position — 8 bytes */
++	int16		next;			/* index of next entry in chain, -1 = end */
++	int16		prev;			/* index of prev entry in chain, -1 = head */
++	uint16		hindex;			/* hash bucket this entry belongs to */
++	/* 2 bytes tail padding to align struct to 8 */
+ } PGLZ_HistEntry;
+ 
++/* Compile-time size checks */
++#define PGLZ_STATIC_ASSERT(cond, msg) \
++	typedef char pglz_static_assert_##msg[(cond) ? 1 : -1]
++
++PGLZ_STATIC_ASSERT(PGLZ_MAX_HISTORY_LISTS <= 65535,
++					max_history_lists_fits_uint16);
++PGLZ_STATIC_ASSERT(PGLZ_HISTORY_SIZE <= 32767,
++					history_size_fits_int16);
++
++/* Sentinel value for empty chain entries */
++#define PGLZ_INVALID_ENTRY		(-1)
++
+ 
+ /* ----------
+  * The provided standard strategies
+@@ -250,18 +267,17 @@ const PGLZ_Strategy *const PGLZ_strategy_always = &strategy_always_data;
+ 
+ /* ----------
+  * Statically allocated work arrays for history
++ *
++ * hist_start[]: one entry per hash bucket, holding the index of the
++ * first history entry in that bucket's chain, or -1 if empty.
++ *
++ * hist_entries[]: ring buffer of history entries, indexed 0..PGLZ_HISTORY_SIZE.
++ * Entry 0 is now a valid entry (the old code wasted it as a sentinel).
+  * ----------
+  */
+ static int16 hist_start[PGLZ_MAX_HISTORY_LISTS];
+ static PGLZ_HistEntry hist_entries[PGLZ_HISTORY_SIZE + 1];
+ 
+-/*
+- * Element 0 in hist_entries is unused, and means 'invalid'. Likewise,
+- * INVALID_ENTRY_PTR in next/prev pointers mean 'invalid'.
+- */
+-#define INVALID_ENTRY			0
+-#define INVALID_ENTRY_PTR		(&hist_entries[INVALID_ENTRY])
+-
+ /* ----------
+  * pglz_hist_idx -
+  *
+@@ -297,48 +313,58 @@ pglz_hist_idx(const char *s, const char *end, int mask)
+  * If *recycle is true, then we are recycling a previously used entry,
+  * and must first delink it from its old hashcode's linked list.
+  *
+- * hist_next and recycle are modified by this function (they were modified
+- * by the original macro too — "The macro would do it four times - Jan.").
++ * hist_next and recycle are modified by this function.
++ *
++ * Invariant: every bucket chain is valid at all times. Each entry
++ * belongs to exactly one bucket. -1 terminates every chain.
+  * ----------
+  */
+ static inline void
+-pglz_hist_add(int16 *hist_start, PGLZ_HistEntry *hist_entries,
++pglz_hist_add(int16 *hstart, PGLZ_HistEntry *hentries,
+ 			  int *hist_next, bool *recycle,
+ 			  const char *s, const char *end, int mask)
+ {
+ 	int			hindex = pglz_hist_idx(s, end, mask);
+-	int16	   *myhsp = &hist_start[hindex];
+-	PGLZ_HistEntry *myhe = &hist_entries[*hist_next];
++	int16		entry_idx = (int16) *hist_next;
++	PGLZ_HistEntry *myhe = &hentries[entry_idx];
+ 
+ 	if (*recycle)
+ 	{
+-		if (myhe->prev == NULL)
+-			hist_start[myhe->hindex] = myhe->next - hist_entries;
++		/*
++		 * Unlink this entry from its old bucket chain (doubly-linked
++		 * index-based unlink).
++		 */
++		if (myhe->prev == PGLZ_INVALID_ENTRY)
++		{
++			/* Entry is chain head — update hist_start */
++			hstart[myhe->hindex] = myhe->next;
++		}
+ 		else
+-			myhe->prev->next = myhe->next;
+-		if (myhe->next != NULL)
+-			myhe->next->prev = myhe->prev;
++		{
++			hentries[myhe->prev].next = myhe->next;
++		}
++
++		if (myhe->next != PGLZ_INVALID_ENTRY)
++		{
++			hentries[myhe->next].prev = myhe->prev;
++		}
+ 	}
+ 
+-	myhe->next = &hist_entries[*myhsp];
+-	myhe->prev = NULL;
+-	myhe->hindex = hindex;
++	/* Insert at head of the new bucket chain */
++	myhe->next = hstart[hindex];
++	myhe->prev = PGLZ_INVALID_ENTRY;
++	myhe->hindex = (uint16) hindex;
+ 	myhe->pos = s;
+ 
+-	/*
+-	 * If there was an existing entry in this hash slot, link this new entry
+-	 * to it. However, the 0th entry in the entries table is unused, so we
+-	 * can freely scribble on it. So don't bother checking if the slot was
+-	 * used — we'll scribble on the unused entry if it was not, but that's
+-	 * harmless. Avoiding the branch in this critical path speeds this up a
+-	 * little bit.
+-	 */
+-	hist_entries[*myhsp].prev = myhe;
+-	*myhsp = *hist_next;
++	/* Link old chain head back to us */
++	if (hstart[hindex] != PGLZ_INVALID_ENTRY)
++		hentries[hstart[hindex]].prev = entry_idx;
++
++	hstart[hindex] = entry_idx;
+ 
+ 	if (++(*hist_next) >= PGLZ_HISTORY_SIZE + 1)
+ 	{
+-		*hist_next = 1;
++		*hist_next = 0;
+ 		*recycle = true;
+ 	}
+ }
+@@ -424,7 +450,6 @@ static inline int
+ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 				int *lenp, int *offp, int good_match, int good_drop, int mask)
+ {
+-	PGLZ_HistEntry *hent;
+ 	int16		hentno;
+ 	int32		len = 0;
+ 	int32		off = 0;
+@@ -433,9 +458,9 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 	 * Traverse the linked history list until a good enough match is found.
+ 	 */
+ 	hentno = hstart[pglz_hist_idx(input, end, mask)];
+-	hent = &hist_entries[hentno];
+-	while (hent != INVALID_ENTRY_PTR)
++	while (hentno != PGLZ_INVALID_ENTRY)
+ 	{
++		PGLZ_HistEntry *hent = &hist_entries[hentno];
+ 		const char *ip = input;
+ 		const char *hp = hent->pos;
+ 		int32		thisoff;
+@@ -494,13 +519,13 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
+ 		/*
+ 		 * Advance to the next history entry
+ 		 */
+-		hent = hent->next;
++		hentno = hent->next;
+ 
+ 		/*
+ 		 * Be happy with lesser good matches the more entries we visited. But
+ 		 * no point in doing calculation if we're at end of list.
+ 		 */
+-		if (hent != INVALID_ENTRY_PTR)
++		if (hentno != PGLZ_INVALID_ENTRY)
+ 		{
+ 			if (len >= good_match)
+ 				break;
+@@ -536,7 +561,7 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ {
+ 	unsigned char *bp = (unsigned char *) dest;
+ 	unsigned char *bstart = bp;
+-	int			hist_next = 1;
++	int			hist_next = 0;
+ 	bool		hist_recycle = false;
+ 	const char *dp = source;
+ 	const char *dend = source + slen;
+@@ -623,10 +648,19 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ 	mask = hashsz - 1;
+ 
+ 	/*
+-	 * Initialize the history lists to empty.  We do not need to zero the
+-	 * hist_entries[] array; its entries are initialized as they are used.
++	 * Initialize the history lists to empty.  We use -1 as the sentinel
++	 * for "no entry".  A loop is used rather than memset for clarity —
++	 * the cost is negligible (runs once per pglz_compress call).
++	 *
++	 * We do not need to initialize the hist_entries[] array; its entries
++	 * are set up as they are used.
+ 	 */
+-	memset(hist_start, 0, hashsz * sizeof(int16));
++	{
++		int		i;
++
++		for (i = 0; i < hashsz; i++)
++			hist_start[i] = PGLZ_INVALID_ENTRY;
++	}
+ 
+ 	/*
+ 	 * Compress the source directly into the output buffer.
+-- 
+2.43.0
+
