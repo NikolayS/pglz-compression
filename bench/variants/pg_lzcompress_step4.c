@@ -507,7 +507,9 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
 	/*
 	 * Traverse the linked history list until a good enough match is found.
 	 */
-	hentno = hstart[pglz_hist_idx(input, end, mask)];
+	int			search_hindex = pglz_hist_idx(input, end, mask);
+
+	hentno = hstart[search_hindex];
 	while (hentno != PGLZ_INVALID_ENTRY)
 	{
 		PGLZ_HistEntry *hent = &hist_entries[hentno];
@@ -515,6 +517,9 @@ pglz_find_match(int16 *hstart, const char *input, const char *end,
 		const char *hp = hent->pos;
 		int32		thisoff;
 		int32		thislen;
+
+			/* Chain integrity check — see step-3 comment */
+		Assert(hent->hindex == (uint16) search_hindex);
 
 		/*
 		 * Stop if the offset does not fit into our tag anymore.
