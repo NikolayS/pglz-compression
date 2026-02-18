@@ -5,3 +5,15 @@ test_asan_*
 !test_asan_roundtrip.c
 bench_step*
 dump_*
+bench/bench_*
+!bench/bench_pglz.c
+
+# Test artifacts
+tests/corpus*/
+tests/fuzz_*
+!tests/fuzz_pglz.c
+tests/test_pglz_regression
+tests/test_combined
+tests/test_fibonacci
+tests/test_skip
+tests/crash-*
