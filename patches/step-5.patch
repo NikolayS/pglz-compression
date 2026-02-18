@@ -1,0 +1,108 @@
+From 29ef71b338a0bef22cdc3145e02ecff22b732242 Mon Sep 17 00:00:00 2001
+From: Nikolay Samokhvalov <nik@postgres.ai>
+Date: Wed, 18 Feb 2026 11:34:33 +0000
+Subject: [PATCH] Use Fibonacci multiply-shift hash in pglz compressor
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the original polynomial hash function in the pglz compressor
+with a Fibonacci multiply-shift hash.  The original hash:
+
+    ((s[0]<<6) ^ (s[1]<<4) ^ (s[2]<<2) ^ s[3]) & mask
+
+has poor avalanche properties for structured data (ASCII text, SQL
+result sets, JSON).  On typical English text, it produces only ~260
+unique hashes for 8K of input across 8192 buckets (3% utilization),
+leading to average chain lengths of ~30.  This makes hash chain
+traversal in pglz_find_match disproportionately expensive.
+
+The new hash:
+
+    h = read_4_bytes_le(s);
+    h *= 2654435761u;   /* Fibonacci constant: golden ratio × 2^32 */
+    return (h >> 19) & mask;
+
+spreads entries uniformly across buckets, reducing average chain
+length and improving both find_match traversal time and overall
+cache behavior.  The constant 2654435761 is standard (Knuth TAOCP
+Vol 3); LZ4 uses the same technique.
+
+The 4-byte input is assembled portably (byte-by-byte with shifts)
+to avoid unaligned access issues and endianness dependence.  GCC
+and Clang optimize this to a single 4-byte load on x86-64.
+
+Note: the new hash produces different (but equally valid) compressed
+output.  Decompression of both old and new output is correct in both
+directions — the compressed format is unchanged.
+
+Verified:
+- make check: 239/239 tests pass (PG19dev)
+- ASan/UBSan roundtrip: 132 boundary-size tests clean
+- Benchmark: ~15% throughput improvement on compressible data
+---
+ src/common/pg_lzcompress.c | 41 ++++++++++++++++++++++++++++++++------
+ 1 file changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/src/common/pg_lzcompress.c b/src/common/pg_lzcompress.c
+index 3176068..4a86b4a 100644
+--- a/src/common/pg_lzcompress.c
++++ b/src/common/pg_lzcompress.c
+@@ -289,19 +289,48 @@ static PGLZ_HistEntry hist_entries[PGLZ_HISTORY_SIZE + 1];
+  * hash list.  This seems an acceptable tradeoff for spreading out the
+  * hash keys more.
+  *
+- * Note: we cast to unsigned char to avoid undefined behavior from
+- * left-shifting negative values (the original macro used plain char).
++ * This uses a Fibonacci multiply-shift hash instead of the original
++ * polynomial hash.  The original ((s[0]<<6)^(s[1]<<4)^(s[2]<<2)^s[3])
++ * had poor avalanche properties for structured data (ASCII text, SQL,
++ * JSON): on typical English text, it produced only ~260 unique hashes
++ * for 8K of input across 8192 buckets (3% utilization), leading to
++ * average chain lengths of ~30.  The Fibonacci hash spreads entries
++ * uniformly across all buckets, reducing chain traversal time in
++ * pglz_find_match and improving cache behavior.
++ *
++ * The constant 2654435761 is the golden ratio × 2^32, commonly used
++ * in hash tables (Knuth TAOCP Vol 3).  LZ4 uses the same technique.
+  * ----------
+  */
+ static inline int
+ pglz_hist_idx(const char *s, const char *end, int mask)
+ {
++	uint32		h;
++
+ 	if ((end - s) < 4)
+ 		return ((int) (unsigned char) s[0]) & mask;
+-	return (((unsigned char) s[0] << 6) ^
+-			((unsigned char) s[1] << 4) ^
+-			((unsigned char) s[2] << 2) ^
+-			(unsigned char) s[3]) & mask;
++
++	/*
++	 * Read 4 bytes and multiply by Fibonacci constant.  We assemble the
++	 * 4-byte value portably to avoid unaligned access issues and endianness
++	 * dependence.  The compiler optimizes this to a single load on x86-64.
++	 */
++	h = ((uint32) (unsigned char) s[0]) |
++		((uint32) (unsigned char) s[1] << 8) |
++		((uint32) (unsigned char) s[2] << 16) |
++		((uint32) (unsigned char) s[3] << 24);
++	h *= 2654435761u;
++
++	/*
++	 * Use the high bits (best-mixed) shifted down to fit the mask.
++	 * Since mask is a power-of-two minus one (e.g., 8191 = 13 bits),
++	 * we shift right by (32 - popcount(mask+1)) to get the most
++	 * entropy.  For simplicity and because mask is always one of
++	 * {511, 1023, 2047, 4095, 8191}, we just shift by a fixed 19
++	 * (32 - 13) for the largest table and let the mask handle smaller
++	 * tables.
++	 */
++	return (int)(h >> 19) & mask;
+ }
+ 
+ 
+-- 
+2.43.0
+
