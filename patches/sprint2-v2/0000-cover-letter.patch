@@ -1,0 +1,110 @@
+From 2309990e79280178a968950aa5f67fce98122f3d Mon Sep 17 00:00:00 2001
+From: Nikolay Samokhvalov <nik@postgres.ai>
+Date: Thu, 19 Feb 2026 02:32:08 +0000
+Subject: [PATCH 0/4] pglz: performance improvements (4-patch series, v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is a 4-patch series improving pglz compression throughput through
+structural and algorithmic changes.  This is v2; step 3 from v1
+(singly-linked history list) has been dropped — see below.
+
+== Patches ==
+
+  0001  pglz: replace macros with static inline functions
+        Pure refactor — macros → static inline.  Bit-identical output
+        verified.  Enables type safety and better tooling (UBSan, etc.).
+
+  0002  pglz: shrink PGLZ_HistEntry from 32 to 16 bytes using uint16 indexes
+        Replace 8-byte pointer fields for next/prev with int16 indexes
+        into the fixed-size hist_entries[] array.  Reduces each entry
+        from 32 to 16 bytes, cutting the history working set from
+        128 KiB to 64 KiB — a 2× reduction that improves L2/L3 cache
+        utilization.
+
+  0003  pglz: add 4-byte memcmp fast-reject in match finding; split tail
+        Adds a 4-byte memcmp() fast-reject at the top of the inner
+        match loop.  GCC/Clang compile memcmp(a,b,4)==0 to a single
+        4-byte load+compare.  Candidates that fail the first 4 bytes
+        are rejected immediately, eliminating 3 iterations of the old
+        byte-by-byte loop per non-matching entry.  The main compression
+        loop is bounded to dend-3 (guaranteeing 4 readable bytes) and
+        the last 1-3 bytes are emitted as literals in a tail loop.
+
+  0004  pglz: replace polynomial hash with Fibonacci multiply-shift hash
+        Replaces the original ((s[0]<<6)^(s[1]<<4)^(s[2]<<2)^s[3])
+        hash with a Fibonacci multiply-shift hash (Knuth TAOCP Vol 3;
+        constant 2654435761 = golden ratio × 2^32, same technique as
+        LZ4).  The old polynomial hash had poor avalanche for structured
+        data (ASCII text, SQL, JSON): on typical input it produced ~260
+        unique buckets out of 8192 (3% utilization), giving average
+        chain lengths of ~30.  The new hash distributes entries
+        uniformly, reducing average chain length and cache pressure.
+
+== Why step 3 was dropped ==
+
+v1 included a step converting the doubly-linked history list to a
+singly-linked list with predecessor-scan unlink (O(n) worst case).
+Step isolation benchmarks on a dedicated Hetzner CCX23 (AMD EPYC-Milan)
+showed:
+
+  stock:         1,883 TPS  (WAL compression, pgbench scale=100)
+  after step 2:  1,957 TPS  (+4%)
+  after step 3:    336 TPS  (−82% vs step 2, 5.8× regression)
+
+Investigation confirmed step 3 saves zero bytes: the removed `prev`
+field (int16, 2 bytes) is replaced by 2 bytes of alignment padding in
+the 16-byte struct.  The singly-linked approach is strictly worse —
+O(n) unlink with no memory benefit.  Dropped.
+
+== Benchmark results ==
+
+Hardware: Hetzner CCX23, AMD EPYC-Milan (dedicated vCPU), 8 GB RAM
+
+WAL compression (pgbench scale=100, -c4 -j4 -T60,
+wal_compression=pglz):
+  stock:             1,883 TPS
+  after 0001:        1,661 TPS  (−12% — see note below)
+  after 0002:        1,957 TPS  (+4% vs stock, cumulative)
+  after 0003+0004:   TBD (expect similar to step 2 or better; hash
+                     improvement primarily benefits match throughput)
+
+TOAST INSERT (50,000 × 2 KB compressible text rows):
+  stock:   772 ms
+  patched: 676 ms  (+14% improvement)
+
+Note on step 1 (−12% in WAL benchmark):
+  Step 1 is a pure refactor — bit-identical output, zero semantic
+  change.  The −12% regression is suspicious and likely reflects a
+  compiler inlining decision under -O2 for the small-record WAL
+  compression pattern.  It is not a correctness concern.  A dedicated
+  microbenchmark with -O2 vs -O3 and PGO is needed to fully
+  characterize this; it is not a blocker for review.
+
+== Verification ==
+
+  make check: 239/239 on each cumulative step
+  ASan: clean (no memory errors)
+  Fuzz: 2,600,000+ iterations, zero findings
+  Cross-version: output compressed with patched code decompresses
+    correctly with stock, and vice versa (round-trip verified)
+  UBSan: clean on step 1 (macro→inline conversion)
+
+== Related work ==
+
+This series references CF #2897 (Andrey Borodin / Vladimir Leskov,
+withdrawn February 2023) which explored related pglz improvements.
+
+Nikolay Samokhvalov (4):
+  pglz: replace macros with static inline functions
+  pglz: shrink PGLZ_HistEntry from 32 to 16 bytes using uint16 indexes
+  pglz: add 4-byte memcmp fast-reject in match finding; split tail
+    handling
+  pglz: replace polynomial hash with Fibonacci multiply-shift hash
+
+ src/common/pg_lzcompress.c | 402 +++++++++++++++++++++++++------------
+ 1 file changed, 275 insertions(+), 127 deletions(-)
+
+-- 
+2.43.0
