@@ -67,6 +67,9 @@ typedef struct PGLZ_Strategy
 	int32		first_success_by;
 	int32		match_size_good;
 	int32		match_size_drop;
+	bool		skip_after_match;	/* Sprint 3 (#24): advance dp by match_len
+									 * instead of 1 after emitting a match tag.
+									 * false = backward-compatible (default). */
 } PGLZ_Strategy;
 
 
@@ -82,6 +85,7 @@ typedef struct PGLZ_Strategy
  */
 extern PGDLLIMPORT const PGLZ_Strategy *const PGLZ_strategy_default;
 extern PGDLLIMPORT const PGLZ_Strategy *const PGLZ_strategy_always;
+extern PGDLLIMPORT const PGLZ_Strategy *const PGLZ_strategy_skip;	/* Sprint 3: skip_after_match=true */
 
 
 /* ----------
