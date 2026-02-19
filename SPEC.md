@@ -500,3 +500,26 @@ The code is proven in standalone harness. Now produce artifacts that can actuall
 - [Unaligned memory access article](https://fastcompression.blogspot.fr/2015/08/accessing-unaligned-memory.html)
 - [LZ4 TOAST compression commit](https://github.com/postgres/postgres/commit/bbe0a81db69bd10bd166907c3701492a29aca294) (PG14)
 - Current source: `src/common/pg_lzcompress.c` (876 lines as of PG19dev)
+
+## Sprint 3 — SIMD, skip-after-match strategy, submission
+
+### Sprint 2 retrospective
+**What worked:** Step isolation benchmark caught step3 cliff immediately. Design agent confirmed zero-byte saving. 4-patch series clean. Skip-after-match implemented as optional patch.
+**What failed:** End-to-end numbers (4% WAL, 14% TOAST) unimpressive — workload not compression-bound. Step1 -12% anomaly unexplained.
+
+### Sprint 3 goals
+1. SIMD match finding — highest ceiling for throughput gain
+2. Skip-after-match WAL ratio measurement — defend or drop the optimization
+3. Skip-after-match as PGLZ_Strategy flag — runtime configurable
+4. Final compression-bound benchmarks + pgsql-hackers submission email
+
+### Sprint 3 issues
+- [ ] #21: WAL ratio measurement for skip-after-match
+- [ ] #22: SIMD SSE2 prototype + microbenchmark
+- [ ] #23: Final benchmarks + submission email
+- [ ] #24: PGLZ_Strategy flag for skip-after-match
+
+### Sprint 3 agents
+- **pglz-s3-alpha**: Issues #22, #24 — SIMD implementation + strategy flag
+- **pglz-s3-beta**: Issue #21 — WAL ratio measurement on real records
+- **pglz-bench-final**: Issue #23 — compression-bound benchmarks (already running)
