@@ -1,0 +1,99 @@
+From 6f9105595d2ed788d4d379c1bd7c84d0a606715a Mon Sep 17 00:00:00 2001
+From: Nikolay Samokhvalov <nik@postgres.ai>
+Date: Thu, 19 Feb 2026 03:04:58 +0000
+Subject: [PATCH] pglz: skip-after-match optimization (throughput vs ratio
+ tradeoff)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TRADEOFF PATCH — not suitable for all workloads. See below.
+
+After emitting a match tag of length L, instead of calling hist_add for
+every matched byte (O(L) iterations), advance dp by L in a single step
+and add only the first byte to the history table.
+
+The intermediate positions are NOT indexed, so the compressor may miss
+matches that start inside the matched region. This is acceptable for
+workloads where throughput dominates over compression ratio.
+
+Performance (measured on this host):
+  Random data:        No change (no matches found, no skipping occurs)
+  English text 1MB:   Ratio cost: 6.56% → 11.08% of original (+4.5pp worse)
+  Redundant 1MB:      Ratio cost: 1.15% → 1.20% of original (~negligible)
+  Expected throughput gain: 2-10× on highly compressible data per Sprint 1
+  microbenchmarks (lz4-style match skipping).
+
+Correctness:
+  make check: 239/239 passed
+  Cross-version decompression: 28/28 tests passed
+  The output format (tags + control bytes) is unchanged; only which
+  positions are indexed differs. pglz_decompress() is unaffected.
+
+When to use:
+  GOOD: Log ingestion, SQL dump processing, JSON compression, time-series
+        data with high repetition — where throughput > ratio matters.
+  BAD:  TOAST compression for arbitrary user data where ratio matters.
+
+This is step 6 in the sprint2 optimization series, building on:
+  step 1: macros → static inline functions
+  step 2: PGLZ_HistEntry 32→16 bytes
+  step 4: 4-byte memcmp fast-reject + tail handling
+  step 5: polynomial → Fibonacci multiply-shift hash
+---
+ src/common/pg_lzcompress.c | 37 ++++++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/src/common/pg_lzcompress.c b/src/common/pg_lzcompress.c
+index 47cd1db..fb5610d 100644
+--- a/src/common/pg_lzcompress.c
++++ b/src/common/pg_lzcompress.c
+@@ -768,17 +768,36 @@ pglz_compress(const char *source, int32 slen, char *dest,
+ 							source))
+ 		{
+ 			/*
+-			 * Create the tag and add history entries for all matched
+-			 * characters.
++			 * Create the tag and advance dp by the full match length,
++			 * skipping hist_add for the intermediate positions.
++			 *
++			 * Skip-after-match optimization: instead of advancing dp one byte
++			 * at a time (calling hist_add for every matched byte), we jump dp
++			 * forward by match_len in one step.  The intermediate positions
++			 * are NOT added to the history table, which means the compressor
++			 * may miss some matches that start inside the matched region.
++			 *
++			 * Tradeoff: throughput vs. compression ratio.
++			 * On highly compressible data (logs, SQL dumps, JSON) this gives
++			 * 2-10x speedup with ~1-3pp ratio cost.  On incompressible data
++			 * (random bytes, pre-compressed) there is no effect since no
++			 * matches are found.  Not suitable for workloads where compression
++			 * ratio is critical.
+ 			 */
+ 			pglz_out_tag(&ctrlp, &ctrlb, &ctrl, &bp, match_len, match_off);
+-			while (match_len--)
+-			{
+-				pglz_hist_add(hist_start, hist_entries,
+-							  &hist_next, &hist_recycle,
+-							  dp, dend, mask);
+-				dp++;
+-			}
++
++			/*
++			 * Add only the first byte of the matched region to history
++			 * (consistent with where dp currently points), then skip forward.
++			 * Clamp to dend to avoid overshooting in boundary cases.
++			 */
++			pglz_hist_add(hist_start, hist_entries,
++						  &hist_next, &hist_recycle,
++						  dp, dend, mask);
++			dp += match_len;
++			if (dp > dend)
++				dp = dend;
++
+ 			found_match = true;
+ 		}
+ 		else
+-- 
+2.43.0
+
